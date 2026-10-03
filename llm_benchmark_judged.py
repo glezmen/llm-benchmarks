@@ -106,6 +106,7 @@ class BenchmarkTest:
 class CallResult:
     ok: bool
     answer: str = ""
+    reasoning: str = ""
     elapsed_s: Optional[float] = None
     ttft_s: Optional[float] = None
     tokens_per_second: Optional[float] = None
@@ -268,12 +269,13 @@ class LMStudioClient:
             )
             elapsed = time.perf_counter() - start
 
-            answer = extract_answer(data)
+            answer, reasoning = extract_response_parts(data)
             stats = find_stats(data)
 
             return CallResult(
                 ok=True,
                 answer=answer,
+                reasoning=reasoning,
                 elapsed_s=elapsed,
                 ttft_s=extract_number(
                     stats,
@@ -324,29 +326,60 @@ class LMStudioClient:
 # Generic response helpers
 # ---------------------------------------------------------------------------
 
-def extract_answer(data: Any) -> str:
-    """Handle several LM Studio/OpenAI-like response shapes."""
-    if not isinstance(data, dict):
-        return str(data)
+def extract_response_parts(data: Any) -> tuple[str, str]:
+    """Extract the final answer separately from LM Studio reasoning.
 
-    # Common LM Studio / native response:
+    LM Studio native responses may contain output items such as
+    {"type": "reasoning", "content": "..."} followed by
+    {"type": "message", "content": "..."}. Reasoning must never be
+    included in the benchmark answer, because checkers and judges evaluate
+    the model's actual final response to the user.
+    """
+    if not isinstance(data, dict):
+        return str(data), ""
+
     output = data.get("output")
     if isinstance(output, list):
-        parts = []
+        answer_parts = []
+        reasoning_parts = []
         for item in output:
             if not isinstance(item, dict):
                 continue
+            item_type = str(item.get("type", "")).lower()
             content = item.get("content")
+
+            texts = []
             if isinstance(content, str):
-                parts.append(content)
+                texts = [content]
             elif isinstance(content, list):
                 for c in content:
                     if isinstance(c, dict) and isinstance(c.get("text"), str):
-                        parts.append(c["text"])
-        if parts:
-            return "".join(parts)
+                        texts.append(c["text"])
+                    elif isinstance(c, str):
+                        texts.append(c)
 
-    # OpenAI-compatible shape:
+            text = "".join(texts)
+            if not text:
+                continue
+
+            if item_type in {"reasoning", "thinking", "analysis"}:
+                reasoning_parts.append(text)
+            elif item_type in {"message", "assistant", "text", "output_text"}:
+                answer_parts.append(text)
+            else:
+                # Unknown output items: prefer explicit message-like items.
+                # Do not contaminate the answer with an item explicitly marked
+                # as reasoning; for legacy shapes, retain textual content.
+                answer_parts.append(text)
+
+        if answer_parts:
+            return "".join(answer_parts), "".join(reasoning_parts)
+        if reasoning_parts:
+            # A reasoning-only response is not a valid final answer. Preserve
+            # reasoning separately so the benchmark can diagnose the failure.
+            return "", "".join(reasoning_parts)
+
+    # OpenAI-compatible shape.
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
@@ -354,18 +387,30 @@ def extract_answer(data: Any) -> str:
             message = first.get("message")
             if isinstance(message, dict):
                 content = message.get("content")
+                reasoning = message.get("reasoning_content")
                 if isinstance(content, str):
-                    return content
+                    return content, reasoning if isinstance(reasoning, str) else ""
+                if isinstance(reasoning, str):
+                    return "", reasoning
             text = first.get("text")
             if isinstance(text, str):
-                return text
+                return text, ""
 
     for key in ("content", "response", "text", "answer"):
         value = data.get(key)
         if isinstance(value, str):
-            return value
+            return value, ""
 
-    return ""
+    reasoning = data.get("reasoning")
+    if isinstance(reasoning, str):
+        return "", reasoning
+
+    return "", ""
+
+
+def extract_answer(data: Any) -> str:
+    """Backward-compatible helper returning only the final answer."""
+    return extract_response_parts(data)[0]
 
 
 def find_stats(data: Any) -> dict[str, Any]:
@@ -2118,8 +2163,21 @@ function installCellNavigation() {{
             event.stopPropagation();
             const target = document.querySelector(this.dataset.navTarget);
             if (!target) return;
-            if (target.tagName.toLowerCase() === 'details') target.open = true;
-            target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+
+            // Category targets live inside the model <details>. Open the
+            // containing model section before scrolling to the exact target.
+            const parentDetails = target.tagName.toLowerCase() === 'details'
+                ? target
+                : target.closest('details[id^="model-"]');
+            if (parentDetails) parentDetails.open = true;
+
+            // Let the browser lay out the newly opened <details> before
+            // calculating the final scroll position.
+            requestAnimationFrame(() => {{
+                target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                target.classList.add('chart-target-highlight');
+                setTimeout(() => target.classList.remove('chart-target-highlight'), 1200);
+            }});
             target.classList.add('chart-target-highlight');
             setTimeout(() => target.classList.remove('chart-target-highlight'), 1200);
         }});
