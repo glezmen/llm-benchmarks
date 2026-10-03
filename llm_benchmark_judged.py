@@ -1863,23 +1863,24 @@ def build_html(results: dict[str, Any]) -> str:
         p = m.get("performance", {})
         cats = category_scores(m, html_judge_weight)
 
+        model_slug = html_slug(m["model"])
         category_cells = "".join(
-            f"<td>{html.escape(fmt_score(cats.get(c, {}).get('objective')))}</td>"
-            f"<td>{html.escape(fmt_score(cats.get(c, {}).get('judge')))}</td>"
-            f"<td class='score'>{html.escape(fmt_score(cats.get(c, {}).get('overall')))}</td>"
+            f'<td class="nav-cell" data-nav-target="#tests-{model_slug}-{html_slug(c)}">{html.escape(fmt_score(cats.get(c, {}).get("objective")))}</td>'
+            f'<td class="nav-cell" data-nav-target="#tests-{model_slug}-{html_slug(c)}">{html.escape(fmt_score(cats.get(c, {}).get("judge")))}</td>'
+            f'<td class="score nav-cell" data-nav-target="#tests-{model_slug}-{html_slug(c)}">{html.escape(fmt_score(cats.get(c, {}).get("overall")))}</td>'
             for c in categories
         )
 
         rows.append(
             "<tr>"
-            f"<td>{i}</td>"
-            f'<td data-sort-value="{html.escape(str(m['model']))}"><code>{html.escape(m['model'])}</code></td>'
-            f"<td class='score'>{html.escape(fmt_score(s.get('overall')))}</td>"
-            f"<td>{html.escape(fmt_score(s.get('objective')))}</td>"
-            f"<td>{html.escape(fmt_score(s.get('judge')))}</td>"
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}">{i}</td>'
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}" data-sort-value="{html.escape(str(m["model"]))}"><code>{html.escape(m["model"])}</code></td>'
+            f'<td class="score nav-cell" data-nav-target="#model-{model_slug}">{html.escape(fmt_score(s.get("overall")))}</td>'
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}">{html.escape(fmt_score(s.get("objective")))}</td>'
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}">{html.escape(fmt_score(s.get("judge")))}</td>'
             f"{category_cells}"
-            f"<td>{html.escape(fmt_num(p.get('mean_tokens_per_second'),1))}</td>"
-            f"<td>{p.get('failed_tests',0)}</td>"
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}">{html.escape(fmt_num(p.get("mean_tokens_per_second"),1))}</td>'
+            f'<td class="nav-cell" data-nav-target="#model-{model_slug}">{p.get("failed_tests",0)}</td>'
             "</tr>"
         )
 
@@ -1919,11 +1920,17 @@ def build_html(results: dict[str, Any]) -> str:
             "<th>Objective</th><th>Judge</th><th>Latency</th>"
             "<th>tok/s</th><th>Status</th></tr>"
         )
+        seen_test_categories = set()
         for t in m.get("tests", []):
             j = t.get("judge", {})
+            category = t.get("category", "")
+            test_anchor = ""
+            if category not in seen_test_categories:
+                test_anchor = f' id="tests-{html_slug(m["model"])}-{html_slug(category)}"'
+                seen_test_categories.add(category)
             detail.append(
-                "<tr>"
-                f"<td>{html.escape(t.get('category',''))}</td>"
+                f"<tr{test_anchor}>"
+                f"<td>{html.escape(category)}</td>"
                 f"<td>{html.escape(t.get('name',''))}</td>"
                 f"<td>{html.escape(fmt_score(t.get('objective_score')))}</td>"
                 f"<td>{html.escape(fmt_score(j.get('score'),scale=10))}</td>"
@@ -1985,6 +1992,8 @@ details {{ margin: .8rem 0; }}
 #chart-wrap {{ width: 100%; overflow-x: auto; margin: 1rem 0 2rem; }}
 #chart-wrap {{ min-width: 900px; height: 560px; }}
 #chart {{ width: 100% !important; height: 100% !important; display: block; }}
+.nav-cell {{ cursor: pointer; }}
+.nav-cell:hover {{ background: #f0f6ff; }}
 .legend {{ margin: .5rem 0 1rem; font-size: .9rem; }}
 .table-wrap th, table th {{ cursor: pointer; user-select: none; }}
 table th:hover {{ background: #ddd; }}
@@ -2103,6 +2112,20 @@ function slugify(value) {{
     return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'item';
 }}
 
+function installCellNavigation() {{
+    document.querySelectorAll('[data-nav-target]').forEach(cell => {{
+        cell.addEventListener('click', function(event) {{
+            event.stopPropagation();
+            const target = document.querySelector(this.dataset.navTarget);
+            if (!target) return;
+            if (target.tagName.toLowerCase() === 'details') target.open = true;
+            target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            target.classList.add('chart-target-highlight');
+            setTimeout(() => target.classList.remove('chart-target-highlight'), 1200);
+        }});
+    }});
+}}
+
 function sortableValue(cell) {{
     if (!cell) return '';
     const raw = (cell.dataset.sortValue || cell.textContent || '').trim();
@@ -2144,6 +2167,7 @@ function installTableSorting() {{
 
 document.addEventListener('DOMContentLoaded', function() {{
     installTableSorting();
+    installCellNavigation();
     const chartCanvas = document.getElementById('chart');
     if (!chartCanvas || typeof Chart === 'undefined') return;
 
