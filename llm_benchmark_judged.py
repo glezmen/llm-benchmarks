@@ -1994,10 +1994,25 @@ def build_html(results: dict[str, Any]) -> str:
             "<table><tr><th>Category</th><th>Objective</th>"
             "<th>Judge</th><th>Overall</th></tr>"
         )
+        # Clicking a category score should take the user to the first concrete
+        # test result in that category (the detailed Prompt & Answer section),
+        # rather than merely to the category summary row.
+        first_test_by_category = {}
+        for t in m.get("tests", []):
+            cat = t.get("category", "")
+            if cat and cat not in first_test_by_category:
+                first_test_by_category[cat] = t
+
         for category in categories:
             cs = cats.get(category, {})
+            first_test = first_test_by_category.get(category)
+            target_id = (
+                f"test-detail-{html_slug(m['model'])}-{html_slug(first_test.get('id', first_test.get('name', '')))}"
+                if first_test else f"category-{html_slug(m['model'])}-{html_slug(category)}"
+            )
             detail.append(
-                f"<tr id=\"category-{html_slug(m['model'])}-{html_slug(category)}\">"
+                f"<tr id=\"category-{html_slug(m['model'])}-{html_slug(category)}\" "
+                f"class=\"nav-cell\" data-nav-target=\"#{html.escape(target_id)}\">"
                 f"<td>{html.escape(category)}</td>"
                 f"<td>{html.escape(fmt_score(cs.get('objective')))}</td>"
                 f"<td>{html.escape(fmt_score(cs.get('judge')))}</td>"
@@ -2019,8 +2034,10 @@ def build_html(results: dict[str, Any]) -> str:
             if category not in seen_test_categories:
                 test_anchor = f' id="tests-{html_slug(m["model"])}-{html_slug(category)}"'
                 seen_test_categories.add(category)
+            test_id = html_slug(t.get("id", t.get("name", "test")))
+            test_detail_id = f"test-detail-{html_slug(m['model'])}-{test_id}"
             detail.append(
-                f"<tr{test_anchor}>"
+                f"<tr{test_anchor} class=\"nav-cell\" data-nav-target=\"#{html.escape(test_detail_id)}\">"
                 f"<td>{html.escape(category)}</td>"
                 f"<td>{html.escape(t.get('name',''))}</td>"
                 f"<td>{html.escape(fmt_score(t.get('objective_score')))}</td>"
@@ -2034,8 +2051,10 @@ def build_html(results: dict[str, Any]) -> str:
 
         for t in m.get("tests", []):
             if t.get("prompt"):
+                test_id = html_slug(t.get("id", t.get("name", "test")))
+                test_detail_id = f"test-detail-{html_slug(m['model'])}-{test_id}"
                 detail.append(
-                    "<details class='answer'>"
+                    f"<details class='answer' id=\"{test_detail_id}\">"
                     f"<summary>{html.escape(t.get('name',''))} — Prompt &amp; Answer</summary>"
                     "<h4>Original prompt</h4>"
                     f"<pre>{html.escape(t.get('prompt',''))}</pre>"
