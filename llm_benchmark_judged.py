@@ -1551,7 +1551,7 @@ def aggregate_model_result(model_result: dict[str, Any], judge_weight: float) ->
 
 
 
-def category_scores(model_result: dict[str, Any]) -> dict[str, dict[str, Optional[float]]]:
+def category_scores(model_result: dict[str, Any], judge_weight: float = DEFAULT_JUDGE_WEIGHT) -> dict[str, dict[str, Optional[float]]]:
     """Return per-category Objective, Judge and Overall averages in 0..1."""
     buckets: dict[str, list[dict[str, Optional[float]]]] = {}
 
@@ -1574,8 +1574,8 @@ def category_scores(model_result: dict[str, Any]) -> dict[str, dict[str, Optiona
 
         if objective_norm is not None and judge_norm is not None:
             overall = (
-                (1.0 - DEFAULT_JUDGE_WEIGHT) * objective_norm
-                + DEFAULT_JUDGE_WEIGHT * judge_norm
+                (1.0 - judge_weight) * objective_norm
+                + judge_weight * judge_norm
             )
         elif objective_norm is not None:
             overall = objective_norm
@@ -1632,14 +1632,21 @@ def build_overall_chart_data(results: dict[str, Any]) -> tuple[list[str], list[d
 
         row = {
             "model": model.get("model", ""),
+            "objective": scores.get("objective"),
+            "judge": scores.get("judge"),
             "Overall": (
                 float(scores["overall"])
                 if isinstance(scores.get("overall"), (int, float))
                 else None
             ),
+            "category_scores": {},
         }
         for category in categories:
             row[category] = cats.get(category, {}).get("overall")
+            row["category_scores"][category] = {
+                "objective": cats.get(category, {}).get("objective"),
+                "judge": cats.get(category, {}).get("judge"),
+            }
         rows.append(row)
 
     return labels, rows
@@ -1790,13 +1797,15 @@ def build_markdown(
 
 
 def build_html(results: dict[str, Any]) -> str:
+    # Interactive HTML weighting starts at 50/50.
+    html_judge_weight = 0.50
     categories = all_categories(results)
     ranking = []
 
     for m in results.get("models", []):
         aggregate_model_result(
             m,
-            results.get("config", {}).get("judge_weight", DEFAULT_JUDGE_WEIGHT),
+            html_judge_weight,
         )
         ranking.append(m)
 
@@ -1824,7 +1833,7 @@ def build_html(results: dict[str, Any]) -> str:
     for i, m in enumerate(ranking, 1):
         s = m.get("scores", {})
         p = m.get("performance", {})
-        cats = category_scores(m)
+        cats = category_scores(m, html_judge_weight)
 
         category_cells = "".join(
             f"<td>{html.escape(fmt_score(cats.get(c, {}).get('objective')))}</td>"
@@ -1859,7 +1868,7 @@ def build_html(results: dict[str, Any]) -> str:
             f"— {html.escape(fmt_score(m.get('scores',{}).get('overall')))}</summary>"
         )
 
-        cats = category_scores(m)
+        cats = category_scores(m, html_judge_weight)
         detail.append(
             f"<h3>Category scores</h3>"
             "<table><tr><th>Category</th><th>Objective</th>"
@@ -1940,6 +1949,11 @@ pre {{ white-space: pre-wrap; background: #f6f6f6; padding: 1rem; overflow-x: au
 details {{ margin: .8rem 0; }}
 .answer {{ margin-left: 1rem; border-left: 3px solid #ccc; padding-left: 1rem; }}
 .answer h4 {{ margin-bottom: .3rem; }}
+.weight-control {{ margin: 1rem 0 1.5rem; padding: 1rem; border: 1px solid #ccc; border-radius: .5rem; background: #fafafa; }}
+.weight-title {{ display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .6rem; }}
+#weight-slider {{ width: 100%; cursor: pointer; }}
+.weight-scale {{ display: flex; justify-content: space-between; font-size: .85rem; color: #666; margin-top: .2rem; }}
+.weight-hint {{ margin-top: .5rem; font-size: .82rem; color: #666; }}
 #chart-wrap {{ width: 100%; overflow-x: auto; margin: 1rem 0 2rem; }}
 #chart-wrap {{ min-width: 900px; height: 560px; }}
 #chart {{ width: 100% !important; height: 100% !important; display: block; }}
@@ -1961,6 +1975,12 @@ Finished: <code>{html.escape(results.get('finished_at',''))}</code></p>
 Each model has one bar for the combined Overall score and one bar for every
 benchmark category. Values are percentages.
 </p>
+<div class="weight-control">
+  <div class="weight-title"><b>Overall weighting</b> <span id="weight-label">Objective 50% / Judge 50%</span></div>
+  <input id="weight-slider" type="range" min="0" max="100" step="1" value="50" aria-label="Objective versus Judge weighting">
+  <div class="weight-scale"><span>100% Objective</span><span>50 / 50</span><span>100% Judge</span></div>
+  <div class="weight-hint">The slider changes only the combined Overall scores; the raw Objective and Judge scores remain unchanged.</div>
+</div>
 <div id="chart-wrap"><canvas id="chart"></canvas></div>
 
 <h2>Ranking and category averages</h2>
@@ -1977,6 +1997,79 @@ benchmark category. Values are percentages.
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 const benchmarkData = {chart_payload};
+
+function combinedScore(objective, judge, judgeWeight) {{
+    if (objective == null && judge == null) return null;
+    if (objective == null) return judge;
+    if (judge == null) return objective;
+    return (1 - judgeWeight) * objective + judgeWeight * judge;
+}}
+
+function pctScore(value) {{
+    return value == null ? '-' : (value * 100).toFixed(1) + '%';
+}}
+
+function applyReportWeight(rawValue) {{
+    const judgeWeight = Number(rawValue) / 100;
+    const objectiveWeight = 1 - judgeWeight;
+    const label = document.getElementById('weight-label');
+    if (label) label.textContent = `Objective ${{Math.round(objectiveWeight * 100)}}% / Judge ${{Math.round(judgeWeight * 100)}}%`;
+
+    const rows = benchmarkData.rows || [];
+    const byModel = new Map(rows.map(r => [r.model, r]));
+
+    const mainTable = document.querySelector('h2 + .table-wrap table');
+    if (mainTable) {{
+        mainTable.querySelectorAll('tr').forEach((tr, index) => {{
+            if (index === 0) return;
+            const cells = tr.children;
+            if (cells.length < 5) return;
+            const model = (cells[1].textContent || '').trim();
+            const row = byModel.get(model);
+            if (!row) return;
+            cells[2].textContent = pctScore(combinedScore(row.objective, row.judge, judgeWeight));
+            let col = 5;
+            for (const category of (benchmarkData.labels || []).slice(1)) {{
+                const cs = row.category_scores?.[category] || {{}};
+                if (cells[col + 2]) cells[col + 2].textContent = pctScore(combinedScore(cs.objective, cs.judge, judgeWeight));
+                col += 3;
+            }}
+        }});
+    }}
+
+    document.querySelectorAll('details[id^="model-"]').forEach(details => {{
+        const model = details.querySelector('summary b')?.textContent?.trim();
+        const row = byModel.get(model);
+        if (!row) return;
+        const summary = details.querySelector('summary');
+        if (summary) {{
+            const textNodes = Array.from(summary.childNodes).filter(n => n.nodeType === Node.TEXT_NODE);
+            if (textNodes.length) textNodes[textNodes.length - 1].textContent = ` — ${{pctScore(combinedScore(row.objective, row.judge, judgeWeight))}}`;
+        }}
+        const table = details.querySelector('table');
+        if (!table) return;
+        table.querySelectorAll('tr').forEach((tr, index) => {{
+            if (index === 0) return;
+            const category = tr.children[0]?.textContent?.trim();
+            const cs = row.category_scores?.[category];
+            if (cs && tr.children[3]) tr.children[3].textContent = pctScore(combinedScore(cs.objective, cs.judge, judgeWeight));
+        }});
+    }});
+
+    const chart = window.benchmarkChart;
+    if (chart) {{
+        chart.data.datasets.forEach((dataset, index) => {{
+            dataset.data = rows.map(row => {{
+                if (index === 0) {{ const score = combinedScore(row.objective, row.judge, judgeWeight); return score == null ? null : score * 100; }}
+                const category = benchmarkData.labels[index];
+                const cs = row.category_scores?.[category] || {{}};
+                const score = combinedScore(cs.objective, cs.judge, judgeWeight);
+                return score == null ? null : score * 100;
+            }});
+        }});
+        chart.update();
+    }}
+}}
 
 function slugify(value) {{
     return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'item';
@@ -2071,6 +2164,15 @@ document.addEventListener('DOMContentLoaded', function() {{
             }}
         }}
     }});
+    window.benchmarkChart = chart;
+}});
+
+document.addEventListener('DOMContentLoaded', function() {{
+    const slider = document.getElementById('weight-slider');
+    if (slider) {{
+        slider.addEventListener('input', () => applyReportWeight(slider.value));
+        applyReportWeight(slider.value);
+    }}
 }});
 </script>
 </body>
