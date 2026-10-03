@@ -99,6 +99,7 @@ class BenchmarkTest:
     checker: Optional[Callable[[str], tuple[Optional[float], str]]] = None
     judgeable: bool = False
     tags: tuple[str, ...] = ()
+    expected_language: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -468,6 +469,33 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+def detect_language(text: str) -> Optional[str]:
+    """Lightweight English/Hungarian detector for benchmark compliance."""
+    words = re.findall(r"[a-zA-ZÀ-ÿ]+", text.lower())
+    if len(words) < 3:
+        return None
+    en = {"the","and","is","are","of","to","in","for","with","that","this","what","when","from","can","will","not","only","return","write","give","explain","answer","should"}
+    hu = {"a","az","és","hogy","van","vagy","egy","nem","meg","mint","ami","amit","ez","azt","kell","lehet","csak","vissza","írj","írd","magyarázd","válasz","szerint","mert"}
+    en_score = sum(w in en for w in words)
+    hu_score = sum(w in hu for w in words) + sum(ch in text.lower() for ch in "áéíóöőúüű") * 2
+    if en_score >= 2 and en_score > hu_score:
+        return "en"
+    if hu_score >= 2 and hu_score > en_score:
+        return "hu"
+    return None
+
+
+def check_expected_language(answer: str, expected: Optional[str]) -> tuple[Optional[float], str]:
+    if not expected:
+        return None, "Language check not configured"
+    detected = detect_language(answer)
+    if detected is None:
+        return 0.0, f"Could not reliably detect expected language {expected}"
+    if detected != expected.lower():
+        return 0.0, f"Wrong answer language: expected {expected}, detected {detected}"
+    return 1.0, f"Answer language is {detected}"
+
+
 def exact_number(expected: str) -> Callable[[str], tuple[Optional[float], str]]:
     def checker(answer: str):
         if re.search(rf"(?<![\d.]){re.escape(expected)}(?![\d.])", answer):
@@ -556,6 +584,7 @@ def checker_no_phrases(
 def build_tests() -> list[BenchmarkTest]:
     return [
         BenchmarkTest(
+            expected_language="en",
             id="math_arithmetic",
             name="Arithmetic chain",
             category="Reasoning",
@@ -568,6 +597,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("math", "exact"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="math_word_problem",
             name="Multi-step business calculation",
             category="Reasoning",
@@ -581,6 +611,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("math", "word-problem"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="logic_seating",
             name="Constraint logic",
             category="Reasoning",
@@ -596,6 +627,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("logic", "constraints"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="planning_schedule",
             name="Dependency scheduling",
             category="Planning",
@@ -612,6 +644,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("planning", "critical-path"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="coding_cpp_sum",
             name="C++ implementation",
             category="Coding",
@@ -626,6 +659,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("cpp", "implementation"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="coding_python_second_largest",
             name="Python implementation",
             category="Coding",
@@ -641,6 +675,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("python", "algorithms"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="coding_cpp_erase",
             name="C++ iterator safety",
             category="Coding",
@@ -655,6 +690,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("cpp", "correctness"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="technical_tcp_udp",
             name="Technical comparison",
             category="Technical",
@@ -668,6 +704,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("networking",),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="technical_dns",
             name="DNS explanation",
             category="Technical",
@@ -684,6 +721,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("dns", "networking"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="structured_json",
             name="Strict JSON output",
             category="Instruction Following",
@@ -699,6 +737,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("json", "format"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="format_exact_lines",
             name="Exact format following",
             category="Instruction Following",
@@ -722,6 +761,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("format", "exact"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="language_hungarian",
             name="Hungarian translation",
             category="Language",
@@ -736,6 +776,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("hungarian", "translation"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="summary_short",
             name="Constrained summary",
             category="Language",
@@ -752,6 +793,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("summarization",),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="hallucination",
             name="Unknown-fact resistance",
             category="Knowledge & Hallucination",
@@ -769,6 +811,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("hallucination", "uncertainty"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="security_reasoning",
             name="Security design",
             category="Technical",
@@ -786,6 +829,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("security",),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="architecture",
             name="Backend architecture",
             category="Technical",
@@ -803,6 +847,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("architecture",),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="context_recall",
             name="Context recall",
             category="Long Context",
@@ -828,6 +873,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("recall", "context"),
         ),
         BenchmarkTest(
+            expected_language="en",
             id="creative_instruction",
             name="Creative constrained writing",
             category="Instruction Following",
@@ -915,6 +961,7 @@ REASON: <one concise paragraph>
 
 Do not give the candidate credit for claims that are unsupported or incorrect.
 Pay attention to exact formatting constraints in the task.
+The candidate answer must be in the same language as the benchmark task/question. If it is in a different language, score it 0.
 
 BENCHMARK TASK:
 ---BEGIN TASK---
@@ -1078,11 +1125,24 @@ def run_single_test(
         except Exception as e:
             objective_reason = f"Checker error: {e}"
 
+    lang_score, lang_reason = check_expected_language(
+        representative.answer, test.expected_language
+    )
+    if test.expected_language is not None and lang_score == 0.0:
+        objective_score = 0.0
+        objective_reason = (
+            f"{objective_reason}; {lang_reason}"
+            if objective_reason else lang_reason
+        )
+    elif test.expected_language is not None and objective_reason:
+        objective_reason = f"{objective_reason}; {lang_reason}"
+
     return {
         "id": test.id,
         "name": test.name,
         "category": test.category,
         "prompt": test.prompt,
+        "expected_language": test.expected_language,
         "judgeable": test.judgeable,
         "tags": list(test.tags),
         "status": "ok",
