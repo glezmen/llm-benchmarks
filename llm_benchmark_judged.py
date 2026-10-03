@@ -73,7 +73,6 @@ DEFAULT_OUTPUT_DIR = "lm_benchmark_results"
 DEFAULT_TIMEOUT = 300
 DEFAULT_REPEATS = 1
 DEFAULT_WARMUP = 1
-DEFAULT_MAX_OUTPUT_TOKENS = 1024
 DEFAULT_JUDGE_WEIGHT = 0.30
 
 # Context scaling is intentionally conservative. A model can reject a level
@@ -94,7 +93,7 @@ class BenchmarkTest:
     name: str
     category: str
     prompt: str
-    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    max_output_tokens: Optional[int] = None
     temperature: float = 0.0
     checker: Optional[Callable[[str], tuple[Optional[float], str]]] = None
     judgeable: bool = False
@@ -126,9 +125,11 @@ class APIError(RuntimeError):
 
 
 class LMStudioClient:
-    def __init__(self, base_url: str, timeout: int = DEFAULT_TIMEOUT):
+    def __init__(self, base_url: str, timeout: int = DEFAULT_TIMEOUT, debug: bool = False, reasoning: str = "auto"):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.debug = debug
+        self.reasoning = reasoning
 
     def request(
         self,
@@ -242,22 +243,32 @@ class LMStudioClient:
         self,
         model: str,
         prompt: str,
-        max_output_tokens: int,
-        temperature: float,
+        max_output_tokens: Optional[int] = None,
+        temperature: float = 0.0,
         context_length: Optional[int] = None,
         timeout: Optional[int] = None,
+        debug: Optional[bool] = None,
     ) -> CallResult:
         payload: dict[str, Any] = {
             "model": model,
             "input": prompt,
             "temperature": temperature,
-            "max_output_tokens": max_output_tokens,
             "stream": False,
             "store": False,
         }
 
         if context_length is not None:
             payload["context_length"] = context_length
+        if self.reasoning != "auto":
+            payload["reasoning"] = self.reasoning
+
+        if debug is None:
+            debug = self.debug
+
+        if debug:
+            print("\n===== LM STUDIO REQUEST JSON =====", flush=True)
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            print("===== END LM STUDIO REQUEST JSON =====\n", flush=True)
 
         start = time.perf_counter()
         try:
@@ -268,6 +279,11 @@ class LMStudioClient:
                 timeout=timeout or self.timeout,
             )
             elapsed = time.perf_counter() - start
+
+            if debug:
+                print("\n===== LM STUDIO RESPONSE JSON =====", flush=True)
+                print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
+                print("===== END LM STUDIO RESPONSE JSON =====\n", flush=True)
 
             answer, reasoning = extract_response_parts(data)
             stats = find_stats(data)
@@ -327,79 +343,115 @@ class LMStudioClient:
 # ---------------------------------------------------------------------------
 
 def extract_response_parts(data: Any) -> tuple[str, str]:
-    """Extract the final answer separately from LM Studio reasoning.
+    """Extract final answer and reasoning without mixing the two.
 
-    LM Studio native responses may contain output items such as
-    {"type": "reasoning", "content": "..."} followed by
-    {"type": "message", "content": "..."}. Reasoning must never be
-    included in the benchmark answer, because checkers and judges evaluate
-    the model's actual final response to the user.
+    Supported response shapes:
+      1. LM Studio native ``output`` items::
+           {"type": "reasoning", "content": "..."}
+           {"type": "message", "content": "..."}
+      2. OpenAI-compatible ``choices[0].message`` with ``content`` and/or
+         ``reasoning_content``.
+      3. Legacy top-level ``content`` / ``response`` / ``text`` / ``answer``.
+
+    Important rule: explicit reasoning is NEVER used as the final answer.
+    A response containing only reasoning therefore has an empty answer.
     """
     if not isinstance(data, dict):
-        return str(data), ""
+        return str(data).strip(), ""
 
+    def content_to_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    # Common multimodal/content-part shapes.
+                    for key in ("text", "content"):
+                        value2 = item.get(key)
+                        if isinstance(value2, str):
+                            parts.append(value2)
+                            break
+            return "".join(parts)
+        return ""
+
+    # ------------------------------------------------------------------
+    # 1. LM Studio native /api/v1/chat response.
+    # ------------------------------------------------------------------
     output = data.get("output")
     if isinstance(output, list):
-        answer_parts = []
-        reasoning_parts = []
+        answer_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        untyped_parts: list[str] = []
+
         for item in output:
             if not isinstance(item, dict):
                 continue
-            item_type = str(item.get("type", "")).lower()
-            content = item.get("content")
 
-            texts = []
-            if isinstance(content, str):
-                texts = [content]
-            elif isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and isinstance(c.get("text"), str):
-                        texts.append(c["text"])
-                    elif isinstance(c, str):
-                        texts.append(c)
-
-            text = "".join(texts)
+            item_type = str(item.get("type", "")).strip().lower()
+            text = content_to_text(item.get("content"))
             if not text:
                 continue
 
-            if item_type in {"reasoning", "thinking", "analysis"}:
+            if item_type in {"reasoning", "thinking", "analysis", "reasoning_content"}:
                 reasoning_parts.append(text)
-            elif item_type in {"message", "assistant", "text", "output_text"}:
+            elif item_type in {
+                "message", "assistant", "text", "output_text", "final", "answer"
+            }:
                 answer_parts.append(text)
+            elif not item_type:
+                # An untyped output item is allowed as a legacy final-answer
+                # item. It is NOT treated as reasoning by default.
+                untyped_parts.append(text)
             else:
-                # Unknown output items: prefer explicit message-like items.
-                # Do not contaminate the answer with an item explicitly marked
-                # as reasoning; for legacy shapes, retain textual content.
-                answer_parts.append(text)
+                # Unknown typed items must not silently become the answer.
+                # Keep them out of scoring; debug/raw JSON still preserves them.
+                continue
 
-        if answer_parts:
-            return "".join(answer_parts), "".join(reasoning_parts)
-        if reasoning_parts:
-            # A reasoning-only response is not a valid final answer. Preserve
-            # reasoning separately so the benchmark can diagnose the failure.
-            return "", "".join(reasoning_parts)
+        answer = "".join(answer_parts)
+        if not answer and untyped_parts:
+            answer = "".join(untyped_parts)
 
-    # OpenAI-compatible shape.
+        # A message containing only whitespace is not a real final answer.
+        answer = answer.strip()
+        reasoning = "".join(reasoning_parts)
+
+        if answer:
+            return answer, reasoning
+        # Reasoning-only (or whitespace-only message) is an empty final answer.
+        return "", reasoning
+
+    # ------------------------------------------------------------------
+    # 2. OpenAI-compatible response shape.
+    # ------------------------------------------------------------------
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
         if isinstance(first, dict):
             message = first.get("message")
             if isinstance(message, dict):
-                content = message.get("content")
-                reasoning = message.get("reasoning_content")
-                if isinstance(content, str):
-                    return content, reasoning if isinstance(reasoning, str) else ""
-                if isinstance(reasoning, str):
-                    return "", reasoning
+                answer = content_to_text(message.get("content")).strip()
+                reasoning = content_to_text(
+                    message.get("reasoning_content")
+                )
+                # Some providers use ``reasoning`` instead.
+                if not reasoning:
+                    reasoning = content_to_text(message.get("reasoning"))
+                return answer, reasoning
+
             text = first.get("text")
             if isinstance(text, str):
-                return text, ""
+                return text.strip(), ""
 
+    # ------------------------------------------------------------------
+    # 3. Legacy top-level response shapes.
+    # ------------------------------------------------------------------
     for key in ("content", "response", "text", "answer"):
         value = data.get(key)
         if isinstance(value, str):
-            return value, ""
+            return value.strip(), ""
 
     reasoning = data.get("reasoning")
     if isinstance(reasoning, str):
@@ -622,6 +674,31 @@ def checker_no_phrases(
     return checker
 
 
+def checker_creative_four_sentences(answer: str) -> tuple[Optional[float], str]:
+    """Check the full constraint set for the rainy-train-station task."""
+    text = answer.strip()
+    if not text:
+        return 0.0, "Empty final answer"
+
+    # Treat sentence-ending punctuation as sentence boundaries.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    sentence_count_ok = len(sentences) == 4
+    semicolon_counts = [sentence.count(";") for sentence in sentences]
+    semicolons_ok = sentence_count_ok and all(count == 1 for count in semicolon_counts)
+    very_ok = "very" not in text.lower()
+    rainy_station_ok = bool(re.search(r"rain|rainy|station|train", text, re.IGNORECASE))
+
+    passed = sum([sentence_count_ok, semicolons_ok, very_ok, rainy_station_ok])
+    score = passed / 4.0
+    reason = (
+        f"sentences={len(sentences)}/4; "
+        f"semicolons=" + ",".join(map(str, semicolon_counts)) + "; "
+        f"forbidden_word={'found' if not very_ok else 'absent'}; "
+        f"rainy/station content={'found' if rainy_station_ok else 'not found'}"
+    )
+    return score, reason
+
+
 # ---------------------------------------------------------------------------
 # Benchmark suite
 # ---------------------------------------------------------------------------
@@ -629,7 +706,6 @@ def checker_no_phrases(
 def build_tests() -> list[BenchmarkTest]:
     return [
         BenchmarkTest(
-            expected_language="en",
             id="math_arithmetic",
             name="Arithmetic chain",
             category="Reasoning",
@@ -637,12 +713,10 @@ def build_tests() -> list[BenchmarkTest]:
                 "Calculate exactly: 37 × 48 + 1250 − 638. "
                 "Return only the final integer."
             ),
-            max_output_tokens=128,
             checker=exact_number("2388"),
             tags=("math", "exact"),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="math_word_problem",
             name="Multi-step business calculation",
             category="Reasoning",
@@ -651,8 +725,7 @@ def build_tests() -> list[BenchmarkTest]:
                 "shipping adds 1,990 Ft. What is the final price in Ft? "
                 "Return only the final integer."
             ),
-            max_output_tokens=128,
-            checker=exact_number("17665"),
+            checker=exact_number("17715"),
             tags=("math", "word-problem"),
         ),
         BenchmarkTest(
@@ -666,7 +739,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "D sits somewhere to the left of A. Who can sit in seat 1? "
                 "Give all possible people and briefly explain."
             ),
-            max_output_tokens=256,
             checker=contains_all(["C", "D"]),
             judgeable=True,
             tags=("logic", "constraints"),
@@ -683,13 +755,11 @@ def build_tests() -> list[BenchmarkTest]:
                 "What is the minimum total elapsed time? Return the number of minutes "
                 "and the critical path."
             ),
-            max_output_tokens=256,
             checker=contains_all(["240", "A", "B", "D", "E"]),
             judgeable=True,
             tags=("planning", "critical-path"),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="coding_cpp_sum",
             name="C++ implementation",
             category="Coding",
@@ -698,13 +768,11 @@ def build_tests() -> list[BenchmarkTest]:
                 "the sum of the even integers. Handle N=0 safely. Return only the "
                 "code in a cpp fenced block."
             ),
-            max_output_tokens=700,
             checker=checker_code_fenced("cpp"),
             judgeable=True,
             tags=("cpp", "implementation"),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="coding_python_second_largest",
             name="Python implementation",
             category="Coding",
@@ -714,7 +782,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "two distinct values exist. Do not sort the list. Return only code "
                 "in a python fenced block."
             ),
-            max_output_tokens=500,
             checker=checker_code_fenced("python"),
             judgeable=True,
             tags=("python", "algorithms"),
@@ -729,7 +796,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "from a std::vector<int> while iterating. Avoid iterator invalidation "
                 "bugs. Keep the answer concise."
             ),
-            max_output_tokens=500,
             checker=contains_all(["erase", "vector"]),
             judgeable=True,
             tags=("cpp", "correctness"),
@@ -743,7 +809,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "Compare TCP and UDP for a real-time multiplayer game. Give exactly "
                 "three bullet points, and mention reliability, latency, and packet loss."
             ),
-            max_output_tokens=300,
             checker=contains_all(["reliability", "latency", "packet loss"]),
             judgeable=True,
             tags=("networking",),
@@ -758,7 +823,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "Mention recursive resolver, cache, authoritative server, and IP address. "
                 "Keep it under 150 words."
             ),
-            max_output_tokens=350,
             checker=contains_all(
                 ["recursive", "cache", "authoritative", "IP"],
             ),
@@ -766,7 +830,6 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("dns", "networking"),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="structured_json",
             name="Strict JSON output",
             category="Instruction Following",
@@ -775,14 +838,12 @@ def build_tests() -> list[BenchmarkTest]:
                 '{"name":"Alice","age":30,"active":true}. '
                 "Do not use markdown."
             ),
-            max_output_tokens=128,
             checker=checker_json_exact(
                 {"name": "Alice", "age": 30, "active": True}
             ),
             tags=("json", "format"),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="format_exact_lines",
             name="Exact format following",
             category="Instruction Following",
@@ -793,7 +854,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "LINE3: blue\n"
                 "LINE4: yellow"
             ),
-            max_output_tokens=128,
             checker=regex_all(
                 [
                     r"^LINE1:\s*red\s*$",
@@ -806,7 +866,7 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("format", "exact"),
         ),
         BenchmarkTest(
-            expected_language="en",
+            expected_language="hu",
             id="language_hungarian",
             name="Hungarian translation",
             category="Language",
@@ -815,7 +875,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "\"The package arrived earlier than expected, but the box was damaged.\" "
                 "Return only the translation."
             ),
-            max_output_tokens=256,
             checker=contains_all(["csomag", "sérült"]),
             judgeable=True,
             tags=("hungarian", "translation"),
@@ -832,7 +891,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "see the old server for several hours. The team kept both servers "
                 "running during the transition and then shut down the old one."
             ),
-            max_output_tokens=180,
             checker=checker_word_count(20, 35),
             judgeable=True,
             tags=("summarization",),
@@ -848,7 +906,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "flight on 17 March 2021? If this information is not established "
                 "in the prompt, say that you cannot know it. Do not invent a value."
             ),
-            max_output_tokens=180,
             checker=contains_all(
                 ["cannot", "not", "know"],
             ),
@@ -866,7 +923,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "token storage, expiration, signing-key validation, transport security, "
                 "and revocation/rotation."
             ),
-            max_output_tokens=500,
             checker=contains_all(
                 ["expiration", "signing", "HTTPS", "rotation"],
             ),
@@ -884,7 +940,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "storage for product images. Describe the main components, data flow, "
                 "and three important failure modes. Keep it under 500 words."
             ),
-            max_output_tokens=800,
             checker=contains_all(
                 ["Vue", "REST", "PostgreSQL", "background", "object storage"],
             ),
@@ -892,7 +947,6 @@ def build_tests() -> list[BenchmarkTest]:
             tags=("architecture",),
         ),
         BenchmarkTest(
-            expected_language="en",
             id="context_recall",
             name="Context recall",
             category="Long Context",
@@ -913,7 +967,6 @@ def build_tests() -> list[BenchmarkTest]:
                 "Question: What is the internal code, budget, deployment region, "
                 "and backup retention?"
             ),
-            max_output_tokens=220,
             checker=contains_all(["ORB-7429-X", "4,275,000", "Frankfurt", "35"]),
             tags=("recall", "context"),
         ),
@@ -927,8 +980,7 @@ def build_tests() -> list[BenchmarkTest]:
                 "Each sentence must contain exactly one semicolon. "
                 "Do not use the word 'very'."
             ),
-            max_output_tokens=300,
-            checker=contains_all([";"]),
+            checker=checker_creative_four_sentences,
             judgeable=True,
             tags=("creative", "constraints"),
         ),
@@ -1156,7 +1208,6 @@ def run_single_test(
         client.chat(
             model_key,
             test.prompt,
-            max_output_tokens=min(test.max_output_tokens, 256),
             temperature=test.temperature,
             context_length=context_length,
         )
@@ -1166,7 +1217,6 @@ def run_single_test(
         result = client.chat(
             model_key,
             test.prompt,
-            max_output_tokens=test.max_output_tokens,
             temperature=test.temperature,
             context_length=context_length,
         )
@@ -1252,7 +1302,6 @@ def run_context_scaling(
     model_key: str,
     levels: list[int],
     warmup: int,
-    output_tokens: int,
 ) -> list[dict[str, Any]]:
     results = []
 
@@ -1277,16 +1326,16 @@ def run_context_scaling(
                 client.chat(
                     model_key,
                     "Reply with exactly: READY",
-                    max_output_tokens=32,
                     temperature=0.0,
+                    debug=False,
                 )
 
             result = client.chat(
                 model_key,
                 prompt,
-                max_output_tokens=output_tokens,
                 temperature=0.0,
                 timeout=max(client.timeout, 600),
+                debug=False,
             )
 
             results.append({
@@ -1374,7 +1423,6 @@ def run_model(
                 client.chat(
                     key,
                     "Reply with exactly: READY",
-                    max_output_tokens=32,
                     temperature=0.0,
                 )
 
@@ -1427,7 +1475,6 @@ def run_model(
             key,
             args.context_levels,
             warmup=0,
-            output_tokens=args.context_output_tokens,
         )
 
     model_result["finished_at"] = now_iso()
@@ -1468,7 +1515,6 @@ CANDIDATE:
     result = client.chat(
         judge_model,
         prompt,
-        max_output_tokens=300,
         temperature=0.0,
         timeout=max(client.timeout, 600),
     )
@@ -2399,10 +2445,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print benchmark request and response JSON for LM Studio chat calls (not context scaling).",
+    )
     p.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     p.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     p.add_argument("--context-length", type=int, default=None)
-    p.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
+    p.add_argument(
+        "--reasoning",
+        choices=["auto", "off", "low", "medium", "high", "on"],
+        default="auto",
+        help="LM Studio reasoning setting. auto leaves the model default unchanged.",
+    )
 
     p.add_argument(
         "--only",
@@ -2453,11 +2509,6 @@ def parse_args() -> argparse.Namespace:
         "--context-levels",
         default="4096,8192,16384,32768",
         help="Comma-separated context sizes.",
-    )
-    p.add_argument(
-        "--context-output-tokens",
-        type=int,
-        default=256,
     )
 
     p.add_argument(
@@ -2520,7 +2571,9 @@ def main() -> int:
         )
         return 2
 
-    client = LMStudioClient(args.base_url, timeout=args.timeout)
+    client = LMStudioClient(
+        args.base_url, timeout=args.timeout, debug=args.debug, reasoning=args.reasoning
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     result_path = output_dir / "benchmark.json"
