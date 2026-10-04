@@ -44,6 +44,7 @@ Useful options:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import dataclasses
 import datetime as dt
@@ -256,6 +257,100 @@ class LMStudioClient:
             {"instance_id": instance_id},
             timeout=max(self.timeout, 120),
         )
+
+    def chat_openai_compat(
+        self,
+        model: str,
+        prompt: str,
+        image_data_url: Optional[str] = None,
+        temperature: float = 0.0,
+        timeout: Optional[int] = None,
+    ) -> CallResult:
+        """Call LM Studio's OpenAI-compatible chat endpoint.
+
+        This is intentionally used for LM Studio Judge vision requests.
+        LM Studio documents `/v1/chat/completions` as supporting text and
+        images using the standard OpenAI `image_url` content part.
+        """
+        if image_data_url:
+            content: list[dict[str, Any]] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url},
+                },
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
+            ]
+        else:
+            content = [{"type": "text", "text": prompt}]
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": temperature,
+            "stream": False,
+        }
+
+        if self.debug:
+            print("\n===== LM STUDIO JUDGE OPENAI-COMPAT REQUEST =====", flush=True)
+            debug_payload = dict(payload)
+            if image_data_url:
+                debug_payload = json.loads(json.dumps(payload))
+                try:
+                    debug_payload["messages"][0]["content"][0]["image_url"]["url"] = (
+                        f"<embedded image omitted; {len(image_data_url):,} chars>"
+                    )
+                except Exception:
+                    pass
+            print(json.dumps(debug_payload, ensure_ascii=False, indent=2), flush=True)
+            print("===== END LM STUDIO JUDGE OPENAI-COMPAT REQUEST =====\n", flush=True)
+
+        start = time.perf_counter()
+        try:
+            data = self.request(
+                "POST",
+                "/v1/chat/completions",
+                payload,
+                timeout=timeout or self.timeout,
+            )
+            elapsed = time.perf_counter() - start
+
+            if self.debug:
+                print("\n===== LM STUDIO JUDGE OPENAI-COMPAT RESPONSE =====", flush=True)
+                print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
+                print("===== END LM STUDIO JUDGE OPENAI-COMPAT RESPONSE =====\n", flush=True)
+
+            answer, reasoning = extract_response_parts(data)
+            stats = find_stats(data)
+            return CallResult(
+                ok=True,
+                answer=answer,
+                reasoning=reasoning,
+                elapsed_s=elapsed,
+                ttft_s=extract_number(
+                    stats,
+                    ["time_to_first_token_seconds", "time_to_first_token", "ttft_seconds", "ttft"],
+                ),
+                tokens_per_second=extract_number(
+                    stats,
+                    ["tokens_per_second", "token_generation_rate", "generation_tokens_per_second", "tps"],
+                ),
+                prompt_tokens=extract_int(stats, ["prompt_tokens", "input_tokens", "prompt_token_count"]),
+                completion_tokens=extract_int(
+                    stats,
+                    ["completion_tokens", "output_tokens", "completion_token_count", "generated_tokens", "total_output_tokens"],
+                ),
+                total_tokens=extract_int(stats, ["total_tokens", "token_count"]),
+                raw=data,
+            )
+        except Exception as e:
+            return CallResult(
+                ok=False,
+                elapsed_s=time.perf_counter() - start,
+                error=str(e),
+            )
 
     def chat(
         self,
@@ -1030,9 +1125,10 @@ def build_tests() -> list[BenchmarkTest]:
             name="Vision: shapes and colors",
             category="Vision",
             prompt=(
-                "Inspect the attached image. List all six colored geometric "
-                "objects and their approximate positions. Do not infer the answer "
-                "from the text of the prompt; use the image itself."
+                "Inspect the attached image carefully and describe what you can see. "
+                "Identify the geometric shapes, their colors, and their approximate "
+                "positions in the image. Do not assume that any particular shape or "
+                "color is present; base your answer only on the image."
             ),
             checker=contains_all([
                 "red circle", "blue triangle", "green square", "yellow triangle",
@@ -1048,11 +1144,13 @@ def build_tests() -> list[BenchmarkTest]:
             name="Vision: photorealistic scene",
             category="Vision",
             prompt=(
-                "Inspect the attached photorealistic image. Describe the scene and "
-                "identify these four required facts: a tabby cat is lying on the "
-                "sofa at the left, a golden retriever is lying on the floor at the "
-                "right, a wooden coffee table is in the foreground center, and a "
-                "wooden bookshelf is against the back wall near the center."
+                "Inspect the attached photorealistic image carefully and describe "
+                "the scene in your own words. Identify all living animals you can "
+                "see, including their type and approximate location. Also describe "
+                "any toy animals or animal-shaped objects, and identify the main "
+                "furniture and other prominent objects with their approximate "
+                "locations. Do not assume that any particular object or animal is "
+                "present; only describe things that you can actually see in the image."
             ),
             checker=contains_all([
                 "tabby cat", "sofa",
@@ -1187,11 +1285,85 @@ def judge_candidate_with_claude(
     model: str,
     timeout: int,
     command: str,
+    image_data_url: Optional[str] = None,
+    judge_image_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
-    judge_prompt = f"""
+    """Judge a candidate with Claude Code, including a real image attachment.
+
+    Claude Code is given a persistent image file inside the benchmark output
+    directory rather than a system temporary directory. This is intentional:
+    Claude Code may refuse file reads from /tmp or macOS's /var/folders/.../T
+    sandbox location. Keeping the image in the project/output tree also makes
+    the exact image used by the judge available for debugging after the run.
+    """
+    image_path: Optional[str] = None
+
+    try:
+        if image_data_url:
+            match = re.match(
+                r"^data:image/([A-Za-z0-9.+-]+);base64,(.+)$",
+                image_data_url,
+                re.DOTALL,
+            )
+            if not match:
+                return {
+                    "score": None,
+                    "reason": "",
+                    "error": "Invalid image data URL passed to Claude Code judge",
+                }
+
+            media_subtype = match.group(1).lower()
+            extension = {
+                "jpeg": ".jpg",
+                "jpg": ".jpg",
+                "png": ".png",
+                "webp": ".webp",
+                "gif": ".gif",
+            }.get(media_subtype, ".img")
+
+            # Keep judge images in the benchmark project/output tree instead
+            # of /tmp. Claude Code can then read them without the macOS
+            # temporary-directory permission problem.
+            if judge_image_dir is None:
+                judge_image_dir = Path.cwd() / DEFAULT_OUTPUT_DIR / "judge_images"
+            else:
+                judge_image_dir = Path(judge_image_dir)
+                if not judge_image_dir.is_absolute():
+                    judge_image_dir = Path.cwd() / judge_image_dir
+
+            judge_image_dir.mkdir(parents=True, exist_ok=True)
+
+            # Derive a stable, human-readable filename from the media type.
+            # A unique suffix prevents collisions if multiple tests/images
+            # happen to use the same extension.
+            digest = __import__("hashlib").sha256(image_data_url.encode("ascii")).hexdigest()[:12]
+            image_path_obj = judge_image_dir / f"image_{digest}{extension}"
+            image_path_obj.write_bytes(base64.b64decode(match.group(2)))
+            image_path = str(image_path_obj.resolve())
+
+        image_instruction = ""
+        if image_path:
+            image_instruction = f"""
+IMAGE ATTACHMENT:
+The benchmark task includes an image. The image has been materialized at this local path:
+{image_path}
+
+You MUST inspect/read that image before scoring the candidate. The image is authoritative
+for any visual facts in the benchmark task. Do not assume that the candidate is correct
+merely because it lists facts that sound plausible. If the task asks about the image,
+verify the candidate's claims against the actual image.
+""".strip()
+
+        judge_prompt = f"""
 You are the evaluator for an LLM benchmark.
 
 Evaluate the candidate answer against the benchmark task.
+
+For visual tasks, independently inspect the supplied image and judge whether the candidate's
+observations are actually supported by what you can see. Do not use hidden benchmark ground
+truth, checker keywords, or assumptions about what the test author intended. The benchmark
+task itself may intentionally be open-ended; evaluate the candidate against the actual image
+and the instructions in the task, not against a list of expected phrases.
 
 Scoring:
 10 = fully correct, complete, and follows all explicit instructions.
@@ -1209,6 +1381,8 @@ Do not give the candidate credit for claims that are unsupported or incorrect.
 Pay attention to exact formatting constraints in the task.
 The candidate answer must be in the same language as the benchmark task/question. If it is in a different language, score it 0.
 
+{image_instruction}
+
 BENCHMARK TASK:
 ---BEGIN TASK---
 {task_prompt}
@@ -1220,54 +1394,69 @@ CANDIDATE ANSWER:
 ---END CANDIDATE---
 """.strip()
 
-    if shutil.which(command) is None:
+        if shutil.which(command) is None:
+            return {
+                "score": None,
+                "reason": "",
+                "error": f"Claude Code executable not found: {command}",
+            }
+
+        try:
+            proc = subprocess.run(
+                [command, "-p", judge_prompt, "--model", model],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception as e:
+            return {
+                "score": None,
+                "reason": "",
+                "error": str(e),
+                "image_attached": bool(image_path),
+                "image_path": image_path,
+            }
+
+        output = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            err = (proc.stderr or output or "Claude Code failed").strip()
+            return {
+                "score": None,
+                "reason": "",
+                "error": f"Claude Code exit code {proc.returncode}: {err[:3000]}",
+                "raw_output": output,
+                "image_attached": bool(image_path),
+                "image_path": image_path,
+            }
+
+        match = re.search(r"SCORE\s*:\s*(10|[0-9])", output, re.IGNORECASE)
+        score = int(match.group(1)) if match else None
+
+        reason_match = re.search(
+            r"REASON\s*:\s*(.*)",
+            output,
+            re.IGNORECASE | re.DOTALL,
+        )
+        reason = reason_match.group(1).strip() if reason_match else output
+
         return {
-            "score": None,
-            "reason": "",
-            "error": f"Claude Code executable not found: {command}",
+            "score": score,
+            "reason": reason,
+            "raw_output": output,
+            "error": None if score is not None else "Could not parse SCORE from Claude output",
+            "image_attached": bool(image_path),
+            "image_path": image_path,
         }
 
-    try:
-        proc = subprocess.run(
-            [command, "-p", judge_prompt, "--model", model],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
     except Exception as e:
         return {
             "score": None,
             "reason": "",
-            "error": str(e),
+            "error": f"Claude Code judge setup/execution error: {e}",
+            "image_attached": bool(image_path),
+            "image_path": image_path,
         }
-
-    output = (proc.stdout or "").strip()
-    if proc.returncode != 0:
-        err = (proc.stderr or output or "Claude Code failed").strip()
-        return {
-            "score": None,
-            "reason": "",
-            "error": f"Claude Code exit code {proc.returncode}: {err[:3000]}",
-            "raw_output": output,
-        }
-
-    match = re.search(r"SCORE\s*:\s*(10|[0-9])", output, re.IGNORECASE)
-    score = int(match.group(1)) if match else None
-
-    reason_match = re.search(
-        r"REASON\s*:\s*(.*)",
-        output,
-        re.IGNORECASE | re.DOTALL,
-    )
-    reason = reason_match.group(1).strip() if reason_match else output
-
-    return {
-        "score": score,
-        "reason": reason,
-        "raw_output": output,
-        "error": None if score is not None else "Could not parse SCORE from Claude output",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1688,13 +1877,24 @@ CANDIDATE:
     if image_instruction:
         prompt += "\n\n" + image_instruction
 
-    result = client.chat(
-        judge_model,
-        prompt,
-        temperature=0.0,
-        timeout=max(client.timeout, 600),
-        image_data_url=image_data_url,
-    )
+    if image_data_url:
+        # Use the OpenAI-compatible endpoint for Judge vision requests.
+        # It uses the standard `image_url` content part and avoids relying on
+        # model-specific handling of the native v1 input array.
+        result = client.chat_openai_compat(
+            judge_model,
+            prompt,
+            image_data_url=image_data_url,
+            temperature=0.0,
+            timeout=max(client.timeout, 600),
+        )
+    else:
+        result = client.chat(
+            judge_model,
+            prompt,
+            temperature=0.0,
+            timeout=max(client.timeout, 600),
+        )
 
     if not result.ok:
         return {
@@ -1756,12 +1956,26 @@ def apply_judging(
                     continue
 
                 if args.judge == "claude-code":
+                    claude_image_url = (
+                        VISION_ASSETS.get(test.get("image_id"))
+                        if test.get("image_id") and not test.get("pdf_id")
+                        else PDF_PAGE_IMAGE_ASSETS.get(test.get("pdf_id"))
+                        if test.get("pdf_id")
+                        else None
+                    )
+                    if args.debug and claude_image_url:
+                        print(
+                            f"Claude Code judge image attachment: "
+                            f"embedded image, {len(claude_image_url):,} chars"
+                        )
                     judged = judge_candidate_with_claude(
                         test["prompt"],
                         test.get("answer", ""),
                         args.judge_model,
                         args.judge_timeout,
                         args.claude_command,
+                        image_data_url=claude_image_url,
+                        judge_image_dir=(Path(args.output_dir) / "judge_images"),
                     )
                 else:
                     judged = judge_with_lmstudio(
