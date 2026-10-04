@@ -567,14 +567,34 @@ def norm(s: str) -> str:
 
 
 def detect_language(text: str) -> Optional[str]:
-    """Lightweight English/Hungarian detector for benchmark compliance."""
-    words = re.findall(r"[a-zA-ZÀ-ÿ]+", text.lower())
-    if len(words) < 3:
+    """Lightweight English/Hungarian detector with short-answer handling."""
+    text_l = text.strip().lower()
+    words = re.findall(r"[a-zA-ZÀ-ÿ]+", text_l)
+    if not words:
         return None
-    en = {"the","and","is","are","of","to","in","for","with","that","this","what","when","from","can","will","not","only","return","write","give","explain","answer","should"}
-    hu = {"a","az","és","hogy","van","vagy","egy","nem","meg","mint","ami","amit","ez","azt","kell","lehet","csak","vissza","írj","írd","magyarázd","válasz","szerint","mert"}
+
+    # Very short benchmark answers are often impossible to classify using
+    # only a generic word-frequency threshold. Recognize a few unambiguous
+    # English constructions explicitly instead of turning a correct answer
+    # such as "I cannot know it." into an objective failure.
+    en_phrases = (
+        "i cannot", "cannot know", "i don't know", "i do not know",
+        "i can't", "not known", "unknown", "the answer is",
+        "yes", "no", "this is", "it is", "it was",
+    )
+    hu_phrases = (
+        "nem tudom", "nem lehet tudni", "nem ismert",
+        "a válasz", "igen", "nem",
+    )
+    if any(p in text_l for p in en_phrases):
+        return "en"
+    if any(p in text_l for p in hu_phrases):
+        return "hu"
+
+    en = {"i","the","and","is","are","of","to","in","for","with","that","this","what","when","from","can","cannot","will","not","only","return","write","give","explain","answer","should","know","it","you","we","was","were","be","has","have","on","as","by"}
+    hu = {"a","az","és","hogy","van","vagy","egy","nem","meg","mint","ami","amit","ez","azt","kell","lehet","csak","vissza","írj","írd","magyarázd","válasz","szerint","mert","tudom","tudni","nem"}
     en_score = sum(w in en for w in words)
-    hu_score = sum(w in hu for w in words) + sum(ch in text.lower() for ch in "áéíóöőúüű") * 2
+    hu_score = sum(w in hu for w in words) + sum(ch in text_l for ch in "áéíóöőúüű") * 2
     if en_score >= 2 and en_score > hu_score:
         return "en"
     if hu_score >= 2 and hu_score > en_score:
@@ -2060,7 +2080,20 @@ def build_html(results: dict[str, Any]) -> str:
                     "<h4>Original prompt</h4>"
                     f"<pre>{html.escape(t.get('prompt',''))}</pre>"
                     "<h4>Model answer</h4>"
-                    f"<pre>{html.escape(t.get('answer',''))}</pre>"
+                    + (
+                        "<div class='answer-status ok'>Status: OK — answer returned</div>"
+                        f"<pre class='model-answer'>{html.escape(t.get('answer') or '')}</pre>"
+                        if str(t.get('status', '')).lower() == 'ok' and (t.get('answer') or '').strip()
+                        else (
+                            "<div class='answer-status error'>Status: ERROR — no answer returned</div>"
+                            f"<div class='error-detail'>{html.escape(t.get('error') or '')}</div>"
+                            "<pre class='model-answer empty-answer'>[No answer returned]</pre>"
+                            if t.get('error')
+                            else
+                            "<div class='answer-status empty'>Status: EMPTY — no final answer returned</div>"
+                            "<pre class='model-answer empty-answer'>[No answer returned]</pre>"
+                        )
+                    )
                     + (
                         f"<p><b>Objective:</b> {html.escape(fmt_score(t.get('objective_score')))}"
                         f" — {html.escape(t.get('objective_reason',''))}</p>"
@@ -2085,6 +2118,36 @@ def build_html(results: dict[str, Any]) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LM Studio Benchmark</title>
 <style>
+        .answer-status {{
+            margin: 8px 0 6px 0;
+            padding: 6px 10px;
+            border-left: 4px solid #888;
+            background: #f5f5f5;
+            font-size: 0.9em;
+            font-weight: 600;
+        }}
+        .answer-status.ok {{ border-left-color: #2e7d32; }}
+        .answer-status.error {{ border-left-color: #c62828; }}
+        .answer-status.empty {{ border-left-color: #ef6c00; }}
+        .error-detail {{
+            margin: 4px 0 8px 0;
+            padding: 6px 10px;
+            background: #fff3f3;
+            color: #8a1c1c;
+            font-family: monospace;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }}
+        pre.model-answer {{
+            min-height: 1.4em;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }}
+        pre.empty-answer {{
+            color: #777;
+            font-style: italic;
+        }}
+
 body {{ font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.45; }}
 table {{ border-collapse: collapse; width: 100%; margin: 1rem 0 2rem; }}
 th, td {{ border: 1px solid #ccc; padding: .45rem .6rem; text-align: left; white-space: nowrap; }}
