@@ -2293,7 +2293,11 @@ function applyReportWeight(rawValue) {{
             .filter(row => typeof row.mean_tokens_per_second === 'number' && Number.isFinite(row.mean_tokens_per_second))
             .map(row => {{
                 const score = combinedScore(row.objective, row.judge, judgeWeight);
-                return {{ x: row.mean_tokens_per_second, y: score == null ? null : score * 100, model: row.model }};
+                return {{
+                    x: row.mean_tokens_per_second,
+                    y: score == null ? null : Math.pow(score, 2) * 100,
+                    model: row.model
+                }};
             }})
             .filter(point => point.y != null);
         speedChart.update();
@@ -2430,7 +2434,11 @@ document.addEventListener('DOMContentLoaded', function() {{
             .filter(row => typeof row.mean_tokens_per_second === 'number' && Number.isFinite(row.mean_tokens_per_second))
             .map(row => {{
                 const score = combinedScore(row.objective, row.judge, judgeWeight);
-                return {{ x: row.mean_tokens_per_second, y: score == null ? null : score * 100, model: row.model }};
+                return {{
+                    x: row.mean_tokens_per_second,
+                    y: score == null ? null : Math.pow(score, 2) * 100,
+                    model: row.model
+                }};
             }})
             .filter(point => point.y != null);
 
@@ -2474,7 +2482,8 @@ document.addEventListener('DOMContentLoaded', function() {{
                     tooltip: {{ callbacks: {{
                         label: context => {{
                             const point = context.raw;
-                            return `${{point.model}}: ${{point.x.toFixed(1)}} tok/s, ${{point.y.toFixed(1)}}% Overall`;
+                            const actualPct = Math.sqrt(Math.max(0, point.y / 100)) * 100;
+                            return `${{point.model}}: ${{point.x.toFixed(1)}} tok/s, ${{actualPct.toFixed(1)}}% Overall`;
                         }}
                     }}}}
                 }},
@@ -2484,10 +2493,15 @@ document.addEventListener('DOMContentLoaded', function() {{
                         beginAtZero: true
                     }},
                     y: {{
-                        title: {{ display: true, text: 'Overall score (%)' }},
-                        beginAtZero: true,
+                        min: 0,
                         max: 100,
-                        ticks: {{ callback: value => value + '%' }}
+                        title: {{ display: true, text: 'Overall score (%) — upper-range expanded' }},
+                        ticks: {{
+                            callback: value => {{
+                                const pct = Math.sqrt(Math.max(0, value / 100)) * 100;
+                                return Math.round(pct) + '%';
+                            }}
+                        }}
                     }}
                 }},
                 onClick: function(event, elements) {{
