@@ -73,7 +73,7 @@ DEFAULT_OUTPUT_DIR = "lm_benchmark_results"
 DEFAULT_TIMEOUT = 300
 DEFAULT_REPEATS = 1
 DEFAULT_WARMUP = 1
-DEFAULT_JUDGE_WEIGHT = 0.30
+DEFAULT_JUDGE_WEIGHT = 0.90
 
 # Context scaling is intentionally conservative. A model can reject a level
 # above its actual supported context length; that is recorded as a result,
@@ -1753,6 +1753,7 @@ def build_overall_chart_data(results: dict[str, Any]) -> tuple[list[str], list[d
             "model": model.get("model", ""),
             "objective": scores.get("objective"),
             "judge": scores.get("judge"),
+            "mean_tokens_per_second": model.get("performance", {}).get("mean_tokens_per_second"),
             "Overall": (
                 float(scores["overall"])
                 if isinstance(scores.get("overall"), (int, float))
@@ -1916,8 +1917,8 @@ def build_markdown(
 
 
 def build_html(results: dict[str, Any]) -> str:
-    # Interactive HTML weighting starts at 50/50.
-    html_judge_weight = 0.50
+    # Interactive HTML weighting starts at 90% Judge / 10% Objective.
+    html_judge_weight = 0.90
     categories = all_categories(results)
     ranking = []
 
@@ -2102,6 +2103,8 @@ details {{ margin: .8rem 0; }}
 #chart-wrap {{ width: 100%; overflow-x: auto; margin: 1rem 0 2rem; }}
 #chart-wrap {{ min-width: 900px; height: 560px; }}
 #chart {{ width: 100% !important; height: 100% !important; display: block; }}
+#speed-chart-wrap {{ width: 100%; height: 280px; margin: 1rem 0 2rem; }}
+#speed-chart {{ width: 100% !important; height: 100% !important; display: block; }}
 .nav-cell {{ cursor: pointer; }}
 .nav-cell:hover {{ background: #f0f6ff; }}
 .legend {{ margin: .5rem 0 1rem; font-size: .9rem; }}
@@ -2123,12 +2126,16 @@ Each model has one bar for the combined Overall score and one bar for every
 benchmark category. Values are percentages.
 </p>
 <div class="weight-control">
-  <div class="weight-title"><b>Overall weighting</b> <span id="weight-label">Objective 50% / Judge 50%</span></div>
-  <input id="weight-slider" type="range" min="0" max="100" step="1" value="50" aria-label="Objective versus Judge weighting">
+  <div class="weight-title"><b>Overall weighting</b> <span id="weight-label">Objective 10% / Judge 90%</span></div>
+  <input id="weight-slider" type="range" min="0" max="100" step="1" value="90" aria-label="Objective versus Judge weighting">
   <div class="weight-scale"><span>100% Objective</span><span>50 / 50</span><span>100% Judge</span></div>
   <div class="weight-hint">The slider changes only the combined Overall scores; the raw Objective and Judge scores remain unchanged.</div>
 </div>
 <div id="chart-wrap"><canvas id="chart"></canvas></div>
+
+<h2>Overall score vs. generation speed</h2>
+<p>Each point represents one model. X = average generation speed (tok/s), Y = Overall score. Click a point to jump to that model's details.</p>
+<div id="speed-chart-wrap"><canvas id="speed-chart"></canvas></div>
 
 <h2>Ranking and category averages</h2>
 <div class="table-wrap">
@@ -2215,6 +2222,18 @@ function applyReportWeight(rawValue) {{
             }});
         }});
         chart.update();
+    }}
+
+    const speedChart = window.speedChart;
+    if (speedChart) {{
+        speedChart.data.datasets[0].data = rows
+            .filter(row => typeof row.mean_tokens_per_second === 'number' && Number.isFinite(row.mean_tokens_per_second))
+            .map(row => {{
+                const score = combinedScore(row.objective, row.judge, judgeWeight);
+                return {{ x: row.mean_tokens_per_second, y: score == null ? null : score * 100, model: row.model }};
+            }})
+            .filter(point => point.y != null);
+        speedChart.update();
     }}
 }}
 
@@ -2340,6 +2359,89 @@ document.addEventListener('DOMContentLoaded', function() {{
         }}
     }});
     window.benchmarkChart = chart;
+
+    const speedCanvas = document.getElementById('speed-chart');
+    if (speedCanvas) {{
+        const judgeWeight = Number(document.getElementById('weight-slider')?.value || 90) / 100;
+        const speedData = benchmarkData.rows
+            .filter(row => typeof row.mean_tokens_per_second === 'number' && Number.isFinite(row.mean_tokens_per_second))
+            .map(row => {{
+                const score = combinedScore(row.objective, row.judge, judgeWeight);
+                return {{ x: row.mean_tokens_per_second, y: score == null ? null : score * 100, model: row.model }};
+            }})
+            .filter(point => point.y != null);
+
+        const speedLabelPlugin = {{
+            id: 'speedModelLabels',
+            afterDatasetsDraw(chart) {{
+                const ctx = chart.ctx;
+                const meta = chart.getDatasetMeta(0);
+                const dataset = chart.data.datasets[0];
+                ctx.save();
+                ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+                ctx.textBaseline = 'middle';
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#374151';
+                meta.data.forEach((element, index) => {{
+                    const point = dataset.data[index];
+                    if (!point || point.model == null) return;
+                    ctx.fillText(String(point.model), element.x + 10, element.y);
+                }});
+                ctx.restore();
+            }}
+        }};
+
+        const speedChart = new Chart(speedCanvas.getContext('2d'), {{
+            type: 'scatter',
+            data: {{
+                datasets: [{{
+                    label: 'Models',
+                    data: speedData,
+                    pointRadius: 7,
+                    pointHoverRadius: 10
+                }}]
+            }},
+            plugins: [speedLabelPlugin],
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {{ mode: 'nearest', intersect: true }},
+                plugins: {{
+                    legend: {{ display: false }},
+                    tooltip: {{ callbacks: {{
+                        label: context => {{
+                            const point = context.raw;
+                            return `${{point.model}}: ${{point.x.toFixed(1)}} tok/s, ${{point.y.toFixed(1)}}% Overall`;
+                        }}
+                    }}}}
+                }},
+                scales: {{
+                    x: {{
+                        title: {{ display: true, text: 'Average generation speed (tok/s)' }},
+                        beginAtZero: true
+                    }},
+                    y: {{
+                        title: {{ display: true, text: 'Overall score (%)' }},
+                        beginAtZero: true,
+                        max: 100,
+                        ticks: {{ callback: value => value + '%' }}
+                    }}
+                }},
+                onClick: function(event, elements) {{
+                    if (!elements.length) return;
+                    const point = speedChart.data.datasets[0].data[elements[0].index];
+                    if (!point?.model) return;
+                    const target = document.getElementById('model-' + slugify(point.model));
+                    if (!target) return;
+                    target.open = true;
+                    target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                    target.classList.add('chart-target-highlight');
+                    setTimeout(() => target.classList.remove('chart-target-highlight'), 1600);
+                }}
+            }}
+        }});
+        window.speedChart = speedChart;
+    }}
 }});
 
 document.addEventListener('DOMContentLoaded', function() {{
@@ -2516,7 +2618,7 @@ def parse_args() -> argparse.Namespace:
         "--judge-weight",
         type=float,
         default=DEFAULT_JUDGE_WEIGHT,
-        help="Weight of 0-10 judge score in combined score (default 0.30).",
+        help="Weight of 0-10 judge score in combined score (default 0.90).",
     )
 
     p.add_argument(
