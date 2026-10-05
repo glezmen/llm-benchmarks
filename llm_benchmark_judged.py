@@ -1509,12 +1509,16 @@ def model_supports_vision(model: dict[str, Any]) -> bool:
 
 
 def skipped_test_result(test: BenchmarkTest, reason: str) -> dict[str, Any]:
+    # A skipped test (for example because the model lacks vision capability)
+    # is a real benchmark failure for scoring purposes.  It therefore gets
+    # zero objective points instead of being silently excluded from the
+    # average.
     return {
         "id": test.id, "name": test.name, "category": test.category,
         "prompt": test.prompt, "expected_language": test.expected_language,
         "judgeable": test.judgeable, "image_id": test.image_id,
         "tags": list(test.tags), "status": "skipped",
-        "objective_score": None, "objective_reason": reason,
+        "objective_score": 0.0, "objective_reason": reason,
         "answer": "", "calls": [], "error": reason,
     }
 
@@ -1576,14 +1580,45 @@ def run_single_test(
             "image_id": test.image_id,
             "pdf_id": test.pdf_id,
             "tags": list(test.tags),
+            # A timeout/API/model failure means that the test could not be
+            # evaluated successfully. Count it as 0 rather than excluding it
+            # from the objective average.
             "status": "error",
-            "objective_score": None,
-            "objective_reason": "",
+            "objective_score": 0.0,
+            "objective_reason": "No evaluable answer: benchmark call failed",
             "calls": [dataclasses.asdict(c) for c in calls],
             "error": calls[-1].error if calls else "No calls",
         }
 
     representative = successful[-1]
+
+    # A technically successful HTTP call with an empty answer is still not an
+    # evaluable benchmark answer. Treat it exactly like a failed test.
+    if not representative.answer or not representative.answer.strip():
+        return {
+            "id": test.id,
+            "name": test.name,
+            "category": test.category,
+            "prompt": test.prompt,
+            "expected_language": test.expected_language,
+            "judgeable": test.judgeable,
+            "image_id": test.image_id,
+            "pdf_id": test.pdf_id,
+            "tags": list(test.tags),
+            "status": "error",
+            "objective_score": 0.0,
+            "objective_reason": "No evaluable answer: model returned an empty answer",
+            "answer": "",
+            "calls": [dataclasses.asdict(c) for c in calls],
+            "latency_s": safe_mean(
+                [r.elapsed_s for r in successful if r.elapsed_s is not None]
+            ),
+            "tokens_per_second": safe_mean(
+                [r.tokens_per_second for r in successful if r.tokens_per_second is not None]
+            ),
+            "error": "Model returned an empty answer",
+        }
+
     objective_score = None
     objective_reason = ""
 
@@ -1950,9 +1985,20 @@ def apply_judging(
             print(f"\nJudging {model_name} ...")
 
             for test in model_result.get("tests", []):
-                # If a judge is enabled, evaluate EVERY successful benchmark
-                # answer. Objective checking remains independent.
+                # Tests with no evaluable answer (timeout/error/capability
+                # skip) receive zero Judge points as well. Do not call the
+                # Judge for them because there is no candidate answer to
+                # evaluate. This makes failed/skipped tests count in both
+                # Objective and Judge averages when judging is enabled.
                 if test.get("status") != "ok":
+                    test["judge"] = {
+                        "score": 0,
+                        "reason": (
+                            "No evaluable answer: test was "
+                            f'{test.get("status", "not successful")}'
+                        ),
+                        "error": None,
+                    }
                     continue
 
                 if args.judge == "claude-code":
@@ -2006,6 +2052,32 @@ def apply_judging(
 # Scoring / reporting
 # ---------------------------------------------------------------------------
 
+def normalize_failed_test_scores(results: dict[str, Any]) -> None:
+    """Ensure non-evaluable test results count as zero in saved reports.
+
+    This also upgrades older benchmark.json files generated before the zero-
+    scoring rule was introduced. Model-level load/discovery failures remain
+    separate and are not converted into fake test results.
+    """
+    judging_enabled = results.get("config", {}).get("judge", "none") != "none"
+    for model_result in results.get("models", []):
+        for test in model_result.get("tests", []):
+            if test.get("status") in {"error", "skipped"}:
+                test["objective_score"] = 0.0
+                if not test.get("objective_reason"):
+                    test["objective_reason"] = (
+                        "No evaluable answer: test failed or was skipped"
+                    )
+                if judging_enabled:
+                    judge = test.get("judge")
+                    if not isinstance(judge, dict) or not isinstance(judge.get("score"), (int, float)):
+                        test["judge"] = {
+                            "score": 0,
+                            "reason": "No evaluable answer: test failed or was skipped",
+                            "error": None,
+                        }
+
+
 def model_scores(model_result: dict[str, Any], judge_weight: float) -> dict[str, Any]:
     objective = []
     judged = []
@@ -2057,11 +2129,30 @@ def aggregate_model_result(model_result: dict[str, Any], judge_weight: float) ->
         if isinstance(t.get("tokens_per_second"), (int, float))
     ]
 
+    # Total wall-clock time spent executing the benchmark tests for this model.
+    # Include failed calls as well when their elapsed time is available. This is
+    # deliberately test runtime only: model load/unload time is not included.
+    total_test_runtime = 0.0
+    have_test_runtime = False
+    for test in tests:
+        call_times = [
+            float(c.get("elapsed_s"))
+            for c in test.get("calls", [])
+            if isinstance(c.get("elapsed_s"), (int, float))
+        ]
+        if call_times:
+            total_test_runtime += sum(call_times)
+            have_test_runtime = True
+        elif isinstance(test.get("latency_s"), (int, float)):
+            total_test_runtime += float(test["latency_s"])
+            have_test_runtime = True
+
     model_result["performance"] = {
         "mean_test_latency_s": safe_mean(latencies),
         "p50_test_latency_s": percentile(latencies, 0.50),
         "p95_test_latency_s": percentile(latencies, 0.95),
         "mean_tokens_per_second": safe_mean(tps),
+        "total_test_runtime_s": total_test_runtime if have_test_runtime else None,
         "successful_tests": sum(t.get("status") == "ok" for t in tests),
         "failed_tests": sum(t.get("status") == "error" for t in tests),
         "skipped_tests": sum(t.get("status") == "skipped" for t in tests),
@@ -2153,6 +2244,7 @@ def build_overall_chart_data(results: dict[str, Any]) -> tuple[list[str], list[d
             "objective": scores.get("objective"),
             "judge": scores.get("judge"),
             "mean_tokens_per_second": model.get("performance", {}).get("mean_tokens_per_second"),
+            "total_test_runtime_s": model.get("performance", {}).get("total_test_runtime_s"),
             "Overall": (
                 float(scores["overall"])
                 if isinstance(scores.get("overall"), (int, float))
@@ -2575,6 +2667,8 @@ details {{ margin: .8rem 0; }}
 #chart {{ width: 100% !important; height: 100% !important; display: block; }}
 #speed-chart-wrap {{ width: 100%; height: 280px; margin: 1rem 0 2rem; }}
 #speed-chart {{ width: 100% !important; height: 100% !important; display: block; }}
+#runtime-chart-wrap {{ width: 100%; height: 280px; margin: 1rem 0 2rem; }}
+#runtime-chart {{ width: 100% !important; height: 100% !important; display: block; }}
 .nav-cell {{ cursor: pointer; }}
 .nav-cell:hover {{ background: #f0f6ff; }}
 .legend {{ margin: .5rem 0 1rem; font-size: .9rem; }}
@@ -2606,6 +2700,10 @@ benchmark category. Values are percentages.
 <h2>Overall score vs. generation speed</h2>
 <p>Each point represents one model. X = average generation speed (tok/s), Y = Overall score. Click a point to jump to that model's details.</p>
 <div id="speed-chart-wrap"><canvas id="speed-chart"></canvas></div>
+
+<h2>Overall score vs. total test runtime</h2>
+<p>Each point represents one model. X = total wall-clock runtime of all benchmark tests for that model (load/unload time excluded), Y = Overall score. Click a point to jump to that model's details.</p>
+<div id="runtime-chart-wrap"><canvas id="runtime-chart"></canvas></div>
 
 <h2>Ranking and category averages</h2>
 <div class="table-wrap">
@@ -2925,6 +3023,99 @@ document.addEventListener('DOMContentLoaded', function() {{
             }}
         }});
         window.speedChart = speedChart;
+
+        const runtimeCanvas = document.getElementById('runtime-chart');
+        if (runtimeCanvas) {{
+            const runtimeData = benchmarkData.rows
+                .filter(row => typeof row.total_test_runtime_s === 'number' && Number.isFinite(row.total_test_runtime_s))
+                .map(row => {{
+                    const score = combinedScore(row.objective, row.judge, judgeWeight);
+                    return {{
+                        x: row.total_test_runtime_s,
+                        y: score == null ? null : Math.pow(score, 2) * 100,
+                        model: row.model
+                    }};
+                }})
+                .filter(point => point.y != null);
+
+            const runtimeLabelPlugin = {{
+                id: 'runtimeModelLabels',
+                afterDatasetsDraw(chart) {{
+                    const ctx = chart.ctx;
+                    const meta = chart.getDatasetMeta(0);
+                    const dataset = chart.data.datasets[0];
+                    ctx.save();
+                    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+                    ctx.textBaseline = 'middle';
+                    ctx.textAlign = 'left';
+                    ctx.fillStyle = '#374151';
+                    meta.data.forEach((element, index) => {{
+                        const point = dataset.data[index];
+                        if (!point || point.model == null) return;
+                        ctx.fillText(String(point.model), element.x + 10, element.y);
+                    }});
+                    ctx.restore();
+                }}
+            }};
+
+            const runtimeChart = new Chart(runtimeCanvas.getContext('2d'), {{
+                type: 'scatter',
+                data: {{
+                    datasets: [{{
+                        label: 'Models',
+                        data: runtimeData,
+                        pointRadius: 7,
+                        pointHoverRadius: 10
+                    }}]
+                }},
+                plugins: [runtimeLabelPlugin],
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {{ mode: 'nearest', intersect: true }},
+                    plugins: {{
+                        legend: {{ display: false }},
+                        tooltip: {{ callbacks: {{
+                            label: context => {{
+                                const point = context.raw;
+                                const actualPct = Math.sqrt(Math.max(0, point.y / 100)) * 100;
+                                const minutes = point.x / 60;
+                                return `${{point.model}}: ${{point.x.toFixed(1)}} s (${{minutes.toFixed(1)}} min), ${{actualPct.toFixed(1)}}% Overall`;
+                            }}
+                        }}}}
+                    }},
+                    scales: {{
+                        x: {{
+                            title: {{ display: true, text: 'Total test runtime (seconds)' }},
+                            beginAtZero: true
+                        }},
+                        y: {{
+                            min: 0,
+                            max: 100,
+                            title: {{ display: true, text: 'Overall score (%) — upper-range expanded' }},
+                            ticks: {{
+                                callback: value => {{
+                                    const pct = Math.sqrt(Math.max(0, value / 100)) * 100;
+                                    return Math.round(pct) + '%';
+                                }}
+                            }}
+                        }}
+                    }},
+                    onClick: function(event, elements) {{
+                        if (!elements.length) return;
+                        const point = runtimeChart.data.datasets[0].data[elements[0].index];
+                        if (!point?.model) return;
+                        const target = document.getElementById('model-' + slugify(point.model));
+                        if (!target) return;
+                        target.open = true;
+                        target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                        target.classList.add('chart-target-highlight');
+                        setTimeout(() => target.classList.remove('chart-target-highlight'), 1600);
+                    }}
+                }}
+            }});
+            window.runtimeChart = runtimeChart;
+        }}
     }}
 }});
 
@@ -2954,6 +3145,7 @@ def build_csv(results: dict[str, Any]) -> str:
         "judge_score",
         "mean_tokens_per_second",
         "mean_test_latency_s",
+        "total_test_runtime_s",
         "successful_tests",
         "failed_tests",
     ])
@@ -2973,6 +3165,7 @@ def build_csv(results: dict[str, Any]) -> str:
             s.get("judge"),
             p.get("mean_tokens_per_second"),
             p.get("mean_test_latency_s"),
+            p.get("total_test_runtime_s"),
             p.get("successful_tests"),
             p.get("failed_tests"),
         ])
@@ -3200,6 +3393,7 @@ def main() -> int:
             )
             return 1
 
+        normalize_failed_test_scores(results)
         write_reports(
             output_dir,
             results,
@@ -3334,6 +3528,7 @@ def main() -> int:
         results["finished_at"] = now_iso()
         json_dump(result_path, results)
 
+    normalize_failed_test_scores(results)
     write_reports(
         output_dir,
         results,
